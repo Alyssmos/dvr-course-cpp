@@ -1,0 +1,265 @@
+// std
+#include <fstream>
+#include <string>
+
+// nanovdb
+#include <nanovdb/GridHandle.h>
+#include <nanovdb/HostBuffer.h>
+#include <nanovdb/NanoVDB.h>
+#include <nanovdb/io/IO.h>
+#include <nanovdb/tools/GridStats.h>
+
+// Header with common resources; .h: host, .cuh: device
+#include <dvr_course-common.h>
+
+// ex03:
+#include "Params.h"
+#ifdef RTCORE
+#include "Params-owl.h"
+#endif
+
+// common namespace for helper classes:
+// Camera, FB, wrappers for RTX execution model, etc. etc.
+using namespace dvr_course;
+
+DECL_LAUNCH_PARAMS(ex03_multi_volume::LaunchParams)
+
+struct {
+  std::vector<std::string> filepaths;
+  std::vector<ex03_multi_volume::Volume> volumes;
+  std::vector<Buffer<uint8_t>> deviceGrids;
+  std::vector<nanovdb::GridHandle<nanovdb::HostBuffer>> hostGrids;
+  std::vector<Transfunc> transfuncs;
+  float unitDistance{1.f};
+} g_appState;
+
+namespace ex03_multi_volume {
+#ifdef RTCORE
+extern "C" char ptxCode[];
+#else
+extern void multiVolumeWoodcock();
+extern void blendingWoodcock();
+#endif
+
+void printUsage() {
+  fprintf(stderr, "%s", "Usage: ex03_multi_volume file.nvdb\n");
+}
+
+static void parseCommandLine(int argc, char *argv[]) {
+
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg[0] != '-' && endsWith(arg,".nvdb"))
+      g_appState.filepaths.push_back(arg);
+  }
+}
+
+extern "C" int main(int argc, char *argv[]) {
+
+  if (argc < 2) {
+    printUsage();
+    exit(-1);
+  }
+
+  parseCommandLine(argc, argv);
+
+  if (g_appState.filepaths.empty()) {
+    printUsage();
+    exit(-1);
+  }
+
+  Pipeline pl(argc, argv, "ex03_multi_volume");
+
+  Pipeline::RTConfig conf;
+#ifdef RTCORE
+  conf.ptxCode = ptxCode;
+  conf.launchParamsDecl = launchParams_owl;
+  conf.sizeOfLaunchParamsStruct = sizeof(LaunchParams);
+#else
+  conf.rayGens.push_back({"multiVolumeWoodcock",multiVolumeWoodcock});
+  conf.rayGens.push_back({"blendingWoodcock",blendingWoodcock});
+#endif
+  pl.initRT(conf);
+  pl.setRayGen("multiVolumeWoodcock");
+
+
+  box3f worldBounds(
+    {INFINITY,INFINITY,INFINITY},
+    {-INFINITY,-INFINITY,-INFINITY}
+  );
+
+  // construct NVDB volumes:
+  for (int i=0; i<g_appState.filepaths.size(); ++i) {
+    nanovdb::GridHandle<nanovdb::HostBuffer> gridHandle;
+
+    try {
+      auto grid = nanovdb::io::readGrid(g_appState.filepaths[i]);
+      auto hostbuffer = nanovdb::HostBuffer::create(grid.bufferSize());
+      std::memcpy(hostbuffer.data(), grid.data(), grid.bufferSize());
+      gridHandle = std::move(hostbuffer);
+    } catch (const std::exception &e) {
+      std::cerr << e.what() << '\n';
+      printUsage();
+      exit(-1);
+    }
+
+    Buffer deviceGrid(gridHandle.bufferSize(), (uint8_t *)gridHandle.data());
+    g_appState.deviceGrids.push_back(deviceGrid);
+
+    // construct device-side volumes:
+    auto boundsMin = gridHandle.gridMetaData()->worldBBox().min();
+    auto boundsMax = gridHandle.gridMetaData()->worldBBox().max();
+    box3f volbounds({(float)boundsMin[0], (float)boundsMin[1], (float)boundsMin[2]},
+                    {(float)boundsMax[0], (float)boundsMax[1], (float)boundsMax[2]});
+
+    Volume volume;
+    volume.filterLinear = true;
+    volume.bounds = volbounds;
+    g_appState.volumes.push_back(volume);
+    g_appState.hostGrids.push_back(std::move(gridHandle));
+
+    worldBounds.extend(volbounds);
+  }
+
+  // assign volume handles:
+  for (int i=0; i<g_appState.deviceGrids.size(); ++i) {
+    Volume &volume = g_appState.volumes[i];
+    volume.handle = (nanovdb::NanoGrid<float> *)g_appState.deviceGrids[i].data();
+  }
+
+  // construct transfuncs:
+  for (int i=0; i<g_appState.volumes.size(); ++i) {
+    if (!pl.transfuncValid(i)) {
+      auto *hostGrid = g_appState.hostGrids[i].grid<float>();
+      dvr_course::Transfunc tf;
+      tf.valueRange = {hostGrid->tree().root().minimum(),
+                       hostGrid->tree().root().maximum()};
+
+      tf.valueRange.lower
+        = fminf(tf.valueRange.lower, hostGrid->tree().root().background());
+      tf.valueRange.upper
+        = fmaxf(tf.valueRange.upper, hostGrid->tree().root().background());
+
+      vec3f rgb = 0.f;
+      rgb[i%3] = 1.f;
+      if (tf.valueRange.empty()) tf.valueRange = {0.f,1.f};
+      tf.setLUT(std::vector<vec4f>({
+        {rgb.r,rgb.g,rgb.b,0.f },
+        {rgb.r,rgb.g,rgb.b,1.f }
+      }));
+      g_appState.transfuncs.push_back(tf);
+    } else {
+      g_appState.transfuncs.push_back(*pl.getTransfunc(i));
+    }
+  }
+
+  int imgWidth=512, imgHeight=512;
+  Frame fb(imgWidth, imgHeight);
+  pl.setFrame(&fb);
+
+  Camera cam;
+  cam.viewAll(worldBounds);
+  pl.setCamera(&cam);
+
+  Buffer volumeBuffer(g_appState.volumes.size(), g_appState.volumes.data());
+
+  std::vector<ex03_multi_volume::Transfunc> deviceTransfuncs(g_appState.transfuncs.size());
+  for (int i=0; i<g_appState.transfuncs.size(); ++i) {
+    pl.setTransfunc(&g_appState.transfuncs[i],i);
+  }
+
+  pl.uiParam("Unit distance", &g_appState.unitDistance, 0.001f, 5.f);
+
+  LaunchParams parms;
+
+  // volumes
+  pl.launchParam("volumes", (RawPointer &)parms.volumes) = (Volume *)volumeBuffer.data();
+  pl.launchParam("numVolumes", parms.numVolumes) = volumeBuffer.size();
+  // lighting
+  pl.launchParam("ambientColor", parms.ambientColor) = vec3f(1.f);
+  pl.launchParam("ambientRadiance", parms.ambientRadiance) = 1.f;
+  // blending
+  pl.launchParam("blendMode", parms.blendMode) = BLEND_MODE_MIX;
+
+  // multi-channel modes:
+  // 1) simply overlap volumes and accept the closest woodcock sample,
+  //    blending happens in the accumulation buffer
+  // 2) upon sampling, evaluate each volume, perform post-classification,
+  //    lerp the resulting color and alpha to give the woodcock sample
+  // 3) same as 2), but instead of lerp, pick the post-classified sample
+  //    with maximum alpha to become the woodcock sample
+  std::vector<std::string> options({
+    { "Multi-volume" },
+    { "Multi-channel, blend mode: mix" },
+    { "Multi-channel, blend mode: max alpha" },
+  });
+  int mode=0, prevMode=-1;
+  pl.uiParam("Mode", options, &mode);
+
+  // Render and present...
+  // For default (PNG image) pipeline this
+  // loop returns immediately
+  do {
+    // camera:
+    struct {
+      vec3f lower_left, horizontal, vertical;
+    } screen;
+    cam.getScreen(screen.lower_left,screen.horizontal,screen.vertical);
+    
+    // transfer functions on device:
+    for (int i=0; i<g_appState.transfuncs.size(); ++i) {
+      deviceTransfuncs[i].valueRange = pl.getTransfunc(i)->valueRange;
+      deviceTransfuncs[i].size = pl.getTransfunc(i)->size;
+      deviceTransfuncs[i].values = pl.getTransfunc(i)->rgbaLUT;
+    }
+    Buffer transfuncBuffer(deviceTransfuncs.size(), deviceTransfuncs.data());
+
+    // toggle multi-volume/channel mode:
+    if (mode != prevMode) {
+      switch (mode) {
+      case 0: default:
+        pl.setRayGen("multiVolumeWoodcock");
+        break;
+      case 1:
+        pl.setRayGen("blendingWoodcock");
+        pl.launchParam("blendMode", parms.blendMode) = BLEND_MODE_MIX;
+        break;
+      case 2:
+        pl.setRayGen("blendingWoodcock");
+        pl.launchParam("blendMode", parms.blendMode) = BLEND_MODE_MAX_ALPHA;
+      }
+      pl.resetAccumulation();
+      prevMode = mode;
+    }
+
+    // update camera:
+    pl.launchParam("camera.org", parms.camera.org) = cam.getPosition();
+    pl.launchParam("camera.dir_00", parms.camera.dir_00) = screen.lower_left;
+    pl.launchParam("camera.dir_du", parms.camera.dir_du) = screen.horizontal / fb.width;
+    pl.launchParam("camera.dir_dv", parms.camera.dir_dv) = screen.vertical / fb.height;
+    // update transfuncs:
+    pl.launchParam("transfuncs", (RawPointer &)parms.transfuncs)
+        = (ex03_multi_volume::Transfunc *)transfuncBuffer.data();
+    // update framebuffer:
+    pl.launchParam("fbPointer", (RawPointer &)parms.fbPointer) = fb.fbPointer;
+    pl.launchParam("fbDepth", (RawPointer &)parms.fbDepth) = fb.fbDepth;
+    pl.launchParam("accumBuffer", (RawPointer &)parms.accumBuffer) = fb.accumBuffer;
+    // update DVR params:
+    pl.launchParam("unitDistance", parms.unitDistance) = g_appState.unitDistance;
+    // update accum:
+    pl.launchParam("accumID", parms.accumID) = pl.frameID;
+
+    // set params:
+    SET_LAUNCH_PARAMS(parms);
+
+    pl.launch();
+    pl.present();
+  } while (pl.isRunning());
+
+  return 0;
+}
+
+} // namespace ex03_multi_volume
+
+
+
