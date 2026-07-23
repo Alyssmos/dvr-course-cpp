@@ -26,6 +26,13 @@ if (DVR_COURSE_WITH_OWL)
   endif()
 endif()
 
+if (WIN32)
+  target_compile_definitions(${PROJECT_NAME} PUBLIC -DNOMINMAX)
+  target_compile_options(${PROJECT_NAME} PUBLIC
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler="/Zc:preprocessor">
+  )
+endif()
+
 target_sources(${PROJECT_NAME} PRIVATE fb.cu pipeline.cu transfunc.cu)
 target_include_directories(${PROJECT_NAME} SYSTEM PUBLIC external)
 target_include_directories(${PROJECT_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
