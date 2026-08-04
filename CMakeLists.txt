@@ -9,6 +9,7 @@ project(dvr-course-cpp LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(DVR_COURSE_WITH_OWL OFF)
 
 include(common/cmake/common.cmake)
 
@@ -21,7 +22,7 @@ add_subdirectory(ex04_lights_on)
 add_subdirectory(ex05_tets_n_friends)
 add_subdirectory(ex06_need_for_speed)
 add_subdirectory(ex07_render_graph)
-add_subdirectory(ex09_anari)
+#add_subdirectory(ex09_anari)
 
 # cmdline tools used for data wrangling, etc.
 # we don't usually need these to run the examples

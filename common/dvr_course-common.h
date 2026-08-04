@@ -24,6 +24,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <algorithm>
 // ours
 #include "dvr_course-common-both.h"
 #include "buffer.h"
